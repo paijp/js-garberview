@@ -4,6 +4,8 @@
 サーバは使わず、ファイルはどこにも送信されない。`index.html` 1 枚で完結して
 いるので、GitHub Pages で開いても、ダウンロードしてローカルで開いてもよい。
 
+**https://paijp.github.io/js-gerberview/**
+
 ## 使い方
 
 1. `index.html` を開く (GitHub Pages、またはダウンロードしてダブルクリック)。

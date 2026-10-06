@@ -1,0 +1,56 @@
+name: deploy-to-vps
+# Deploys the logging copy to k-keiei.jp: index.html with vps/logger.js
+# added, plus log.php.
+on:
+  push:
+    branches: [main]
+    paths: ['index.html', 'vps/**', 'examples/**', '.github/workflows/deploy.yml']
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  VPS_HOST: k-keiei.jp
+  DEST_PREFIX: gerberview
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tests/run.js
+
+      - name: Collect files
+        run: |
+          mkdir _vps
+          cp -r vps/. _vps/
+          # Only this copy loads the logger; index.html in the repo has none.
+          grep -q '</body>' index.html
+          sed 's#</body>#<script src="logger.js"></script>\n</body>#' index.html > _vps/index.html
+          grep -q 'src="logger.js"' _vps/index.html
+          cp -r examples _vps/
+
+      - name: PUT files to VPS /deploy
+        run: |
+          set -euo pipefail
+          cd _vps
+          mapfile -t files < <(find . -type f | sed 's|^\./||' | sort)
+          for rel in "${files[@]}"; do
+            # Each OIDC token is accepted once, so mint one per file.
+            token=$(curl -sS \
+              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${VPS_HOST}" | jq -r '.value')
+            echo "::add-mask::$token"
+            echo "PUT $rel"
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -X PUT --data-binary @"$rel" \
+              -H "Authorization: Bearer $token" \
+              -H 'Content-Type: application/octet-stream' \
+              "https://${VPS_HOST}/mcp/messages/deploy/${DEST_PREFIX}/${rel}")
+            test "$code" = "200" || { echo "failed: $rel -> HTTP $code"; exit 1; }
+          done
