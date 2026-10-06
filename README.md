@@ -58,3 +58,7 @@ mask にして色を付けて合成する (textpcb のプレビューと同じ�
 
 `main` に push すると `.github/workflows/pages.yml` がテストを走らせてから公開する。
 初回だけ、リポジトリの Settings → Pages → Source を「GitHub Actions」にしておく。
+
+## ライセンス
+
+MIT License。[LICENSE](LICENSE) を参照。
