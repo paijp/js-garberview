@@ -8,6 +8,8 @@
   :root { --bg: #2b2b2b; --panel: #f4f4f4; --line: #ccc; --text: #222; }
   html, body { margin: 0; padding: 0; height: 100%; font-family: sans-serif; font-size: 13px; color: var(--text); }
   body { display: flex; flex-direction: column; background: var(--bg); }
+  body.light { --bg: #ffffff; }
+  body.light #drop { color: #666; border-color: #aaa; }
   header { padding: 6px 12px; background: #eee; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
   header h1 { font-size: 14px; margin: 0 6px 0 0; }
   header button, header label.file { font-size: 12px; padding: 3px 10px; border: 1px solid var(--line); background: #fff; cursor: pointer; border-radius: 3px; }
@@ -39,6 +41,9 @@
     <button data-mode="top" class="on">部品面</button><button data-mode="bottom">半田面</button><button data-mode="layers">レイヤー</button>
   </span>
   <button id="fit">全体表示</button>
+  <span class="group" id="themes">
+    <button data-theme="dark" class="on">黒背景</button><button data-theme="light">白背景</button>
+  </span>
 </header>
 <div id="main">
   <div id="layers"><div class="empty">ファイルが読み込まれていません</div></div>
@@ -677,6 +682,24 @@ const LAYER_TYPES = [
   ["outline", "外形"], ["drill", "穴"], ["other", "その他"], ["ignore", "無視"],
 ];
 const SIDES = [["top", "表"], ["bottom", "裏"], ["inner", "内層"], ["all", "-"]];
+// Drill files use the side field for plating: "all" is plated (or unknown),
+// "npth" is non-plated.
+const DRILL_SIDES = [["all", "穴(スルー)"], ["npth", "穴(ノンスルー)"]];
+
+// Archive clutter that is never a layer: macOS resource forks and Finder files.
+function isJunkEntry(name) {
+  return /(^|\/)__MACOSX\//.test(name) || /(^|\/)\._/.test(name) || /(^|\/)\.DS_Store$/.test(name);
+}
+// KiCad and others say in the file whether the holes are plated: an X2
+// attribute (in Excellon, inside a comment) or a comment naming NPTH.
+function drillSide(name, text) {
+  const head = (text || "").slice(0, 4000);
+  const ff = /TF\.FileFunction,(NonPlated|Plated)/i.exec(head);
+  if (ff) return /^NonPlated$/i.test(ff[1]) ? "npth" : "all";
+  if (/^\s*;.*\b(NPTH|non[-_ ]?plated)\b/im.test(head)) return "npth";
+  if (/npth|non[-_ ]?plated/i.test(name.replace(/^.*\//, ""))) return "npth";
+  return "all";
+}
 
 function isExcellon(text) {
   return /^\s*(M48|;\s*DRILL|;.*Excellon)/im.test(text.slice(0, 2000)) || (/^T\d+C[0-9.]/m.test(text) && !/%FS/.test(text));
@@ -698,9 +721,9 @@ function identifyLayer(name, text) {
     if (k === "legend") return { type: "silk", side };
     if (k === "paste") return { type: "paste", side };
     if (k === "profile") return { type: "outline", side: "all" };
-    if (k === "plated" || k === "nonplated") return { type: "drill", side: "all" };
+    if (k === "plated" || k === "nonplated") return { type: "drill", side: k === "nonplated" ? "npth" : "all" };
   }
-  if (text && isExcellon(text)) return { type: "drill", side: "all" };
+  if (text && isExcellon(text)) return { type: "drill", side: drillSide(name, text) };
   const ext = (lower.match(/\.([a-z0-9]+)$/) || [])[1] || "";
   const byExt = {
     gtl: ["copper", "top"], gbl: ["copper", "bottom"], cmp: ["copper", "top"], sol: ["copper", "bottom"],
@@ -712,7 +735,7 @@ function identifyLayer(name, text) {
   };
   if (/^g\d+$/.test(ext) && ext !== "g1") return { type: "copper", side: "inner" };
   if (/^gp\d+$|^g\d+l$/.test(ext)) return { type: "copper", side: "inner" };
-  if (byExt[ext]) return { type: byExt[ext][0], side: byExt[ext][1] };
+  if (byExt[ext]) return { type: byExt[ext][0], side: byExt[ext][0] === "drill" ? drillSide(name, text) : byExt[ext][1] };
   const rules = [
     [/(f[._-]?cu|top[._-]?(copper|layer)|copper[._-]?top|\btop\b(?!.*(mask|silk|paste|overlay)))/, "copper", "top"],
     [/(b[._-]?cu|bot(tom)?[._-]?(copper|layer)|copper[._-]?bot)/, "copper", "bottom"],
@@ -724,9 +747,9 @@ function identifyLayer(name, text) {
     [/(f[._-]?paste|top[._-]?paste|paste[._-]?top)/, "paste", "top"],
     [/(b[._-]?paste|bot(tom)?[._-]?paste|paste[._-]?bot)/, "paste", "bottom"],
     [/(edge[._-]?cuts|outline|profile|board[._-]?shape|mechanical)/, "outline", "all"],
-    [/(drill|hole|npth|pth)/, "drill", "all"],
+    [/(drill|\bdrl\b|hole|npth|pth)/, "drill", "all"],
   ];
-  for (const [re, type, side] of rules) if (re.test(lower)) return { type, side };
+  for (const [re, type, side] of rules) if (re.test(lower)) return { type, side: type === "drill" ? drillSide(name, text) : side };
   if (/\.(txt|nc|tap)$/.test(lower) && text && /^T\d+/m.test(text)) return { type: "drill", side: "all" };
   if (/readme|\.(pdf|png|jpg|csv|xlsx|ipc|rpt|pos|html?)$/.test(lower)) return { type: "ignore", side: "all" };
   return { type: "other", side: "all" };
@@ -854,8 +877,20 @@ const DEFAULT_COLORS = {
   silk: { top: "#f0f0f0", bottom: "#e0d0ff", all: "#f0f0f0", inner: "#f0f0f0" },
   paste: { top: "#a0a0a0", bottom: "#808080", all: "#a0a0a0", inner: "#a0a0a0" },
   outline: { all: "#ffdc3c", top: "#ffdc3c", bottom: "#ffdc3c", inner: "#ffdc3c" },
-  drill: { all: "#000000", top: "#000000", bottom: "#000000", inner: "#000000" },
+  drill: { all: "#000000", npth: "#5a78ff", top: "#000000", bottom: "#000000", inner: "#000000" },
   other: { all: "#c080ff", top: "#c080ff", bottom: "#c080ff", inner: "#c080ff" },
+  ignore: { all: "#888888", top: "#888888", bottom: "#888888", inner: "#888888" },
+};
+// White background: textpcb's print scheme. Layers multiply like inks, so
+// top copper (magenta) over bottom copper (cyan) reads as blue.
+const LIGHT_COLORS = {
+  copper: { top: "#ff00ff", bottom: "#00ffff", inner: "#c8c8c8", all: "#c8c8c8" },
+  mask: { top: "#e8e8e8", bottom: "#e0e0e0", all: "#e8e8e8", inner: "#e8e8e8" },
+  silk: { top: "#ffff00", bottom: "#e0e080", all: "#ffff00", inner: "#ffff00" },
+  paste: { top: "#d8d8d8", bottom: "#d0d0d0", all: "#d8d8d8", inner: "#d8d8d8" },
+  outline: { all: "#000000", top: "#000000", bottom: "#000000", inner: "#000000" },
+  drill: { all: "#000000", npth: "#606060", top: "#000000", bottom: "#000000", inner: "#000000" },
+  other: { all: "#a060e0", top: "#a060e0", bottom: "#a060e0", inner: "#a060e0" },
   ignore: { all: "#888888", top: "#888888", bottom: "#888888", inner: "#888888" },
 };
 const BOARD = { mask: "#1d5c2a", copperUnder: "#3b8a3f", substrate: "#bfa66a", copperOpen: "#d8b45a", silk: "#f4f4f4", bg: "#2b2b2b", hole: "#151515" };
@@ -904,7 +939,7 @@ const svg = document.getElementById("view");
 const stage = document.getElementById("stage");
 let maskSeq = 0;
 
-function layerColor(L) { return L.color || DEFAULT_COLORS[L.type][L.side]; }
+function layerColor(L) { return L.color || (state.light ? LIGHT_COLORS : DEFAULT_COLORS)[L.type][L.side]; }
 
 function boardBBox() {
   const b = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
@@ -980,7 +1015,10 @@ function rebuild() {
   if (state.mode === "layers") {
     const order = ["outline", "copper", "paste", "mask", "silk", "other", "drill"];
     const sorted = vis.slice().sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
-    for (const L of sorted) layerShape(L, layerColor(L), root, { opacity: L.type === "drill" ? 1 : 0.75 });
+    for (const L of sorted) {
+      if (state.light) layerShape(L, layerColor(L), root, { style: "mix-blend-mode:multiply" });
+      else layerShape(L, layerColor(L), root, { opacity: L.type === "drill" ? 1 : 0.75 });
+    }
   } else {
     const side = state.mode;
     const of = (type) => vis.filter(L => L.type === type && (L.side === side || L.side === "all"));
@@ -993,8 +1031,26 @@ function rebuild() {
       const b = boardBBox() || { minX: 0, minY: 0, maxX: 0, maxY: 0 };
       boardMask = maskOfPath("M" + b.minX + " " + b.minY + "H" + b.maxX + "V" + b.maxY + "H" + b.minX + "Z", "nonzero");
     }
-    const copper = of("copper"), masks = of("mask"), silk = of("silk"), drills = of("drill");
+    // Holes go through, whichever side is shown.
+    const copper = of("copper"), masks = of("mask"), silk = of("silk"), drills = vis.filter(L => L.type === "drill");
     const copperMask = maskOf(copper);
+    if (state.light) {
+      // textpcb's print scheme: yellow where the solder mask covers, cyan for
+      // copper, magenta for silk, all multiplied; holes and outline in black.
+      const mul = { style: "mix-blend-mode:multiply" };
+      const onB = el("g", { mask: boardMask }, root);
+      cover("#ffffff", onB);
+      const yellow = el("g", mul, onB);
+      cover("#ffff00", yellow);
+      if (masks.length) cover("#ffffff", yellow, { mask: maskOf(masks) });
+      cover("#00ffff", onB, Object.assign({ mask: copperMask }, mul));
+      if (silk.length) cover("#ff00ff", onB, Object.assign({ mask: maskOf(silk) }, mul));
+      if (drills.length) cover("#000000", root, { mask: maskOf(drills) });
+      for (const L of outlines) layerShape(L, "#000000", root);
+      for (const L of of("other")) layerShape(L, layerColor(L), root, mul);
+      state.measureEl = el("line", { stroke: "#f00", "stroke-width": 1.5, "vector-effect": "non-scaling-stroke", "stroke-dasharray": "6 4", visibility: "hidden" }, root);
+      return;
+    }
     const onBoard = el("g", { mask: boardMask }, root);
     // Solder mask over the board, copper under it a lighter shade.
     cover(BOARD.mask, onBoard);
@@ -1053,6 +1109,7 @@ async function loadFiles(fileList) {
   }
   const layers = [];
   for (const e of entries) {
+    if (isJunkEntry(e.name)) continue;
     if (e.error) { layers.push({ name: e.name, type: "ignore", side: "all", error: e.error }); continue; }
     const L = loadLayerFile(e.name, e.data);
     if (L.parsed) {
@@ -1094,14 +1151,20 @@ function buildLayerList() {
     nm.className = "name"; nm.textContent = L.name.replace(/^.*\//, "");
     nm.title = L.name + (L.error ? "\n" + L.error : "") + (L.parsed && L.parsed.warnings.length ? "\n" + L.parsed.warnings.join("\n") : "");
     const sel = document.createElement("select");
-    for (const [t, label] of LAYER_TYPES) for (const [s, sl] of SIDES) {
+    for (const [t, label] of LAYER_TYPES) for (const [s, sl] of (t === "drill" ? DRILL_SIDES : SIDES)) {
+      if (t === "drill") {
+        const o = document.createElement("option");
+        o.value = t + "/" + s; o.textContent = sl;
+        sel.appendChild(o);
+        continue;
+      }
       const needsSide = ["copper", "mask", "silk", "paste"].includes(t);
       if (needsSide ? s === "all" : s !== "all") continue;
       const o = document.createElement("option");
       o.value = t + "/" + s; o.textContent = label + (needsSide ? "(" + sl + ")" : "");
       sel.appendChild(o);
     }
-    sel.value = L.type + "/" + (["copper", "mask", "silk", "paste"].includes(L.type) ? (L.side === "all" ? "top" : L.side) : "all");
+    sel.value = L.type + "/" + (["copper", "mask", "silk", "paste"].includes(L.type) ? (L.side === "all" ? "top" : L.side) : L.type === "drill" ? L.side : "all");
     sel.disabled = !L.parsed;
     sel.onchange = () => {
       [L.type, L.side] = sel.value.split("/");
@@ -1119,6 +1182,16 @@ stage.addEventListener("dragover", (e) => { e.preventDefault(); stage.classList.
 stage.addEventListener("dragleave", () => stage.classList.remove("drag"));
 stage.addEventListener("drop", (e) => { e.preventDefault(); stage.classList.remove("drag"); if (e.dataTransfer.files.length) loadFiles([...e.dataTransfer.files]); });
 document.getElementById("fit").onclick = () => { fitView(); requestRender(); };
+function setTheme(light) {
+  state.light = light;
+  document.body.classList.toggle("light", light);
+  for (const o of document.querySelectorAll("#themes button")) o.classList.toggle("on", (o.dataset.theme === "light") === light);
+  try { localStorage.setItem("gerberview.theme", light ? "light" : "dark"); } catch (e) {}
+  buildLayerList();
+  invalidate();
+}
+for (const b of document.querySelectorAll("#themes button")) b.onclick = () => setTheme(b.dataset.theme === "light");
+try { if (localStorage.getItem("gerberview.theme") === "light") setTheme(true); } catch (e) {}
 for (const b of document.querySelectorAll("#modes button")) {
   b.onclick = () => {
     const prev = state.mode;

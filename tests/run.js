@@ -12,7 +12,7 @@ function loadLib() {
   const i = s.indexOf("// @@lib-begin"), j = s.indexOf("// @@lib-end");
   const ctx = { TextDecoder, Blob, Response, DecompressionStream, Uint8Array, DataView, Math };
   vm.createContext(ctx);
-  vm.runInContext(s.slice(i, j) + "\nthis.lib = { readZip, parseGerber, parseExcellon, identifyLayer, loadLayerFile, itemsBBox, evalMacroExpr, svgPathData, outlineLoops };", ctx);
+  vm.runInContext(s.slice(i, j) + "\nthis.lib = { readZip, parseGerber, parseExcellon, identifyLayer, loadLayerFile, isJunkEntry, itemsBBox, evalMacroExpr, svgPathData, outlineLoops };", ctx);
   return ctx.lib;
 }
 const lib = loadLib();
@@ -113,6 +113,12 @@ test("identify: common naming schemes", () => {
     const id = lib.identifyLayer(n, "");
     assert.strictEqual(id.type + "/" + id.side, want, n);
   }
+  const npth = lib.identifyLayer("proj-NPTH.drl", "M48\n; DRILL file {KiCad 7}\n; #@! TF.FileFunction,NonPlated,1,4,NPTH\nMETRIC\n%\nM30\n");
+  assert.strictEqual(npth.type + "/" + npth.side, "drill/npth");
+  const pth = lib.identifyLayer("proj-PTH.drl", "M48\n; #@! TF.FileFunction,Plated,1,4,PTH\nMETRIC\n%\nM30\n");
+  assert.strictEqual(pth.type + "/" + pth.side, "drill/all");
+  assert.strictEqual(lib.identifyLayer("plmain.DRL.GBR", "%FSLAX43Y43*%").type, "drill");
+  assert.ok(lib.isJunkEntry("__MACOSX/._a-F_Cu.gbr") && lib.isJunkEntry("x/._a.gbr") && !lib.isJunkEntry("a-F_Cu.gbr"));
   const x2 = lib.identifyLayer("x.gbr", "%TF.FileFunction,Soldermask,Bot*%");
   assert.strictEqual(x2.type + "/" + x2.side, "mask/bottom");
 });
