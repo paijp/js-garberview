@@ -1035,14 +1035,17 @@ function rebuild() {
     const copper = of("copper"), masks = of("mask"), silk = of("silk"), drills = vis.filter(L => L.type === "drill");
     const copperMask = maskOf(copper);
     if (state.light) {
-      // textpcb's print scheme: yellow where the solder mask covers, cyan for
-      // copper, magenta for silk, all multiplied; holes and outline in black.
+      // textpcb's print scheme: yellow where the solder mask covers (and no
+      // silk), cyan for copper, magenta for silk, all multiplied; holes and
+      // outline in black.
       const mul = { style: "mix-blend-mode:multiply" };
       const onB = el("g", { mask: boardMask }, root);
       cover("#ffffff", onB);
       const yellow = el("g", mul, onB);
       cover("#ffff00", yellow);
       if (masks.length) cover("#ffffff", yellow, { mask: maskOf(masks) });
+      // Silk hides whether the mask is there: magenta alone, blue over copper.
+      if (silk.length) cover("#ffffff", yellow, { mask: maskOf(silk) });
       cover("#00ffff", onB, Object.assign({ mask: copperMask }, mul));
       if (silk.length) cover("#ff00ff", onB, Object.assign({ mask: maskOf(silk) }, mul));
       if (drills.length) cover("#000000", root, { mask: maskOf(drills) });
