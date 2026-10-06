@@ -12,7 +12,7 @@ function loadLib() {
   const i = s.indexOf("// @@lib-begin"), j = s.indexOf("// @@lib-end");
   const ctx = { TextDecoder, Blob, Response, DecompressionStream, Uint8Array, DataView, Math };
   vm.createContext(ctx);
-  vm.runInContext(s.slice(i, j) + "\nthis.lib = { readZip, parseGerber, parseExcellon, identifyLayer, loadLayerFile, itemsBBox, evalMacroExpr };", ctx);
+  vm.runInContext(s.slice(i, j) + "\nthis.lib = { readZip, parseGerber, parseExcellon, identifyLayer, loadLayerFile, itemsBBox, evalMacroExpr, svgPathData, outlineLoops };", ctx);
   return ctx.lib;
 }
 const lib = loadLib();
@@ -115,6 +115,22 @@ test("identify: common naming schemes", () => {
   }
   const x2 = lib.identifyLayer("x.gbr", "%TF.FileFunction,Soldermask,Bot*%");
   assert.strictEqual(x2.type + "/" + x2.side, "mask/bottom");
+});
+
+test("svg: full circle becomes two half arcs, quarter arc keeps its sweep", () => {
+  assert.strictEqual(lib.svgPathData([["M", 1, 0], ["A", 0, 0, 1, 0, Math.PI * 2, false], ["Z"]]),
+    "M1 0A1 1 0 0 1 -1 0A1 1 0 0 1 1 0Z");
+  assert.strictEqual(lib.svgPathData([["M", 1, 0], ["A", 0, 0, 1, 0, -Math.PI / 2, true]]), "M1 0A1 1 0 0 0 0 -1");
+});
+
+test("outline: segments in any order and direction close into loops", () => {
+  const seg = (x1, y1, x2, y2) => ({ pol: "D", kind: "stroke", width: 0.1, path: [["M", x1, y1], ["L", x2, y2]] });
+  const items = [seg(0, 0, 10, 0), seg(0, 5, 0, 0), seg(10, 5, 10, 0), seg(10, 5, 0, 5),
+    { pol: "D", kind: "stroke", width: 0.1, path: [["M", 6, 2.5], ["A", 5, 2.5, 1, 0, Math.PI * 2, false]] },
+    seg(20, 0, 21, 0)];
+  const loops = lib.outlineLoops(items);
+  assert.strictEqual(loops.length, 2);
+  assert.strictEqual(loops[1].filter(c => c[0] === "L").length, 4);
 });
 
 // textpcb's own exporter, when its checkout sits next to this one.

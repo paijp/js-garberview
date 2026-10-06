@@ -24,7 +24,7 @@
   #layers .row.err .name { color: #c00; }
   #layers .empty { padding: 8px; color: #777; }
   #stage { flex: 1 1 0; position: relative; overflow: hidden; touch-action: none; }
-  #stage canvas { position: absolute; left: 0; top: 0; }
+  #stage svg { position: absolute; left: 0; top: 0; }
   #drop { position: absolute; inset: 20px; border: 2px dashed #888; border-radius: 8px; color: #bbb; display: flex; align-items: center; justify-content: center; text-align: center; font-size: 16px; line-height: 1.8; pointer-events: none; }
   #stage.drag #drop { border-color: #fc0; color: #fc0; }
   footer { padding: 3px 12px; background: #eee; border-top: 1px solid var(--line); font-size: 12px; display: flex; gap: 16px; white-space: nowrap; overflow: hidden; }
@@ -43,7 +43,7 @@
 <div id="main">
   <div id="layers"><div class="empty">ファイルが読み込まれていません</div></div>
   <div id="stage">
-    <canvas id="view"></canvas>
+    <svg id="view" xmlns="http://www.w3.org/2000/svg"></svg>
     <div id="drop">ガーバー一式の ZIP（または個別ファイル）をここにドロップ<br>
       ホイール: 拡大縮小 / ドラッグ: 移動 / Shift+ドラッグ: 距離の計測<br>
       ファイルはブラウザ内だけで処理され、どこにも送信されません</div>
@@ -745,9 +745,109 @@ function loadLayerFile(name, data) {
   if (error && id.type !== "ignore") id.type = "ignore";
   return { name, type: id.type, side: id.side, parsed, error };
 }
+/* ---------- SVG path data ----------
+   Paths are kept in board coordinates (mm, Y up); the SVG flips them with a
+   group transform, so the arc sweep flag follows the math direction. */
+function fmtN(v) {
+  let s = v.toFixed(4);
+  if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
+  return s === "-0" ? "0" : s;
+}
+function svgPathData(path) {
+  const out = [];
+  let cx = null, cy = null;
+  for (const c of path) {
+    if (c[0] === "M") { out.push("M" + fmtN(c[1]) + " " + fmtN(c[2])); cx = c[1]; cy = c[2]; }
+    else if (c[0] === "L") { out.push("L" + fmtN(c[1]) + " " + fmtN(c[2])); cx = c[1]; cy = c[2]; }
+    else if (c[0] === "Z") out.push("Z");
+    else if (c[0] === "A") {
+      const [, ox, oy, r, a0, a1, ccwFlag] = c;
+      const sx = ox + r * Math.cos(a0), sy = oy + r * Math.sin(a0);
+      if (cx === null || Math.abs(cx - sx) > 1e-6 || Math.abs(cy - sy) > 1e-6) {
+        out.push((cx === null ? "M" : "L") + fmtN(sx) + " " + fmtN(sy));
+      }
+      const sweep = ccwFlag ? 0 : 1;          // canvas "anticlockwise" = decreasing angle
+      let d = Math.abs(a1 - a0);
+      if (r <= 0) { cx = sx; cy = sy; continue; }
+      if (d >= Math.PI * 2 - 1e-9) {
+        // A full circle is two half arcs; one arc with equal ends draws nothing.
+        const mid = a0 + (ccwFlag ? -Math.PI : Math.PI);
+        out.push("A" + fmtN(r) + " " + fmtN(r) + " 0 0 " + sweep + " " + fmtN(ox + r * Math.cos(mid)) + " " + fmtN(oy + r * Math.sin(mid)));
+        d = Math.PI;
+      }
+      const ex = ox + r * Math.cos(a1), ey = oy + r * Math.sin(a1);
+      out.push("A" + fmtN(r) + " " + fmtN(r) + " 0 " + (d > Math.PI ? 1 : 0) + " " + sweep + " " + fmtN(ex) + " " + fmtN(ey));
+      cx = ex; cy = ey;
+    }
+  }
+  return out.join("");
+}
+
+/* ---------- board shape from the outline ----------
+   Outline files are strokes drawn in any order. Chain them end to end into
+   closed loops; filled even-odd, the loops give the board with its cutouts. */
+function outlineLoops(items, tol) {
+  tol = tol || 0.02;
+  const segs = [];
+  const endOf = (c, prev) => c[0] === "A" ? [c[1] + c[3] * Math.cos(c[5]), c[2] + c[3] * Math.sin(c[5])] : [c[1], c[2]];
+  const startOfArc = c => [c[1] + c[3] * Math.cos(c[4]), c[2] + c[3] * Math.sin(c[4])];
+  const loops = [];
+  for (const it of items) {
+    if (it.pol !== "D") continue;
+    if (it.kind === "fill") { loops.push(it.path); continue; }
+    let cur = null;
+    for (const c of it.path) {
+      if (c[0] === "M") cur = [c[1], c[2]];
+      else if (c[0] === "L" || c[0] === "A") {
+        const s = c[0] === "A" ? startOfArc(c) : cur;
+        const e = endOf(c);
+        if (Math.hypot(e[0] - s[0], e[1] - s[1]) > 1e-9 || c[0] === "A") segs.push({ s, e, c });
+        cur = e;
+      }
+    }
+  }
+  // A full circle stands alone as a loop.
+  const rest = [];
+  for (const g of segs) {
+    if (g.c[0] === "A" && Math.abs(g.c[5] - g.c[4]) >= Math.PI * 2 - 1e-9) loops.push([["M", g.s[0], g.s[1]], g.c, ["Z"]]);
+    else rest.push(g);
+  }
+  const used = new Array(rest.length).fill(false);
+  const near = (a, b) => Math.abs(a[0] - b[0]) <= tol && Math.abs(a[1] - b[1]) <= tol;
+  const rev = (c, s) => c[0] === "A" ? ["A", c[1], c[2], c[3], c[5], c[4], !c[6]] : ["L", s[0], s[1]];
+  for (let i = 0; i < rest.length; i++) {
+    if (used[i]) continue;
+    used[i] = true;
+    const start = rest[i].s;
+    let end = rest[i].e;
+    const path = [["M", start[0], start[1]], rest[i].c];
+    let closed = near(start, end);
+    while (!closed) {
+      let found = -1, flipped = false;
+      for (let k = 0; k < rest.length; k++) {
+        if (used[k]) continue;
+        if (near(rest[k].s, end)) { found = k; break; }
+        if (near(rest[k].e, end)) { found = k; flipped = true; break; }
+      }
+      if (found < 0) break;
+      used[found] = true;
+      const g = rest[found];
+      path.push(flipped ? rev(g.c, g.s) : g.c);
+      end = flipped ? g.s : g.e;
+      closed = near(start, end);
+    }
+    if (closed) { path.push(["Z"]); loops.push(path); }
+  }
+  return loops;
+}
 // @@lib-end
 
-/* ---------- rendering ---------- */
+/* ---------- rendering ----------
+   The view is one SVG in board units, so zooming stays sharp at any scale:
+   panning and zooming only move the viewBox, and the drawing is rebuilt only
+   when what is shown changes. Each layer becomes a mask (white where exposed,
+   black where a clear-polarity object removes it), and the board views tint
+   and combine those masks the way textpcb's preview does. */
 const DEFAULT_COLORS = {
   copper: { top: "#d4482b", bottom: "#2b6fd4", inner: "#d4a52b", all: "#d4a52b" },
   mask: { top: "#3cb04a", bottom: "#3ca0b0", all: "#3cb04a", inner: "#3cb04a" },
@@ -759,47 +859,50 @@ const DEFAULT_COLORS = {
   ignore: { all: "#888888", top: "#888888", bottom: "#888888", inner: "#888888" },
 };
 const BOARD = { mask: "#1d5c2a", copperUnder: "#3b8a3f", substrate: "#bfa66a", copperOpen: "#d8b45a", silk: "#f4f4f4", bg: "#2b2b2b", hole: "#151515" };
+const SVG_NS = "http://www.w3.org/2000/svg";
 
-function buildPath2D(path) {
-  const p = new Path2D();
-  for (const c of path) {
-    if (c[0] === "M") p.moveTo(c[1], c[2]);
-    else if (c[0] === "L") p.lineTo(c[1], c[2]);
-    else if (c[0] === "A") p.arc(c[1], c[2], c[3], c[4], c[5], c[6]);
-    else if (c[0] === "Z") p.closePath();
-  }
-  return p;
-}
-// Turn an item list into runs of same polarity; each run holds one fill path
-// and one stroke path per width, so a layer draws in a handful of calls.
+// Group a layer's items into runs of one polarity; each run is one fill path
+// plus one stroke path per width, so a layer is a handful of elements.
 function compileLayer(items) {
   const runs = [];
   let cur = null;
   for (const it of items) {
-    if (!cur || cur.pol !== it.pol) { cur = { pol: it.pol, fill: new Path2D(), hasFill: false, strokes: new Map() }; runs.push(cur); }
-    const p = buildPath2D(it.path);
-    if (it.kind === "fill") { cur.fill.addPath(p); cur.hasFill = true; }
+    if (!cur || cur.pol !== it.pol) { cur = { pol: it.pol, fill: [], strokes: new Map() }; runs.push(cur); }
+    const d = svgPathData(it.path);
+    if (it.kind === "fill") cur.fill.push(d);
     else {
       const w = it.width || 0;
-      if (!cur.strokes.has(w)) cur.strokes.set(w, new Path2D());
-      cur.strokes.get(w).addPath(p);
+      if (!cur.strokes.has(w)) cur.strokes.set(w, []);
+      cur.strokes.get(w).push(d);
     }
   }
-  return runs;
+  return runs.map(r => ({ pol: r.pol, fill: r.fill.join(""), strokes: [...r.strokes].map(([w, ds]) => [w, ds.join("")]) }));
 }
-function drawRuns(g, runs, minPx) {
-  g.lineCap = "round"; g.lineJoin = "round";
+function el(name, attrs, parent) {
+  const e = document.createElementNS(SVG_NS, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+// Draw runs into g. In a mask, dark is white and clear is black; drawn plainly,
+// a clear run can only be approximated, so layers with one go through a mask.
+function appendRuns(g, runs, dark, clear) {
   for (const r of runs) {
-    g.globalCompositeOperation = r.pol === "D" ? "source-over" : "destination-out";
-    if (r.hasFill) g.fill(r.fill, "nonzero");
-    for (const [w, p] of r.strokes) { g.lineWidth = Math.max(w, minPx); g.stroke(p); }
+    const color = r.pol === "D" ? dark : clear;
+    if (r.fill) el("path", { d: r.fill, fill: color, "fill-rule": "nonzero" }, g);
+    for (const [w, d] of r.strokes) {
+      const a = { d, fill: "none", stroke: color, "stroke-linecap": "round", "stroke-linejoin": "round" };
+      // Zero-width apertures still show as a hairline.
+      if (w > 0) a["stroke-width"] = w; else { a["stroke-width"] = 1; a["vector-effect"] = "non-scaling-stroke"; }
+      el("path", a, g);
+    }
   }
-  g.globalCompositeOperation = "source-over";
 }
 
 const state = { layers: [], mode: "top", view: null, measure: null };
-const canvas = document.getElementById("view");
+const svg = document.getElementById("view");
 const stage = document.getElementById("stage");
+let maskSeq = 0;
 
 function layerColor(L) { return L.color || DEFAULT_COLORS[L.type][L.side]; }
 
@@ -814,6 +917,14 @@ function boardBBox() {
   }
   return isFinite(b.minX) ? b : null;
 }
+function allBBox() {
+  const b = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  for (const L of state.layers) if (L.parsed && L.type !== "ignore") {
+    b.minX = Math.min(b.minX, L.bbox.minX); b.minY = Math.min(b.minY, L.bbox.minY);
+    b.maxX = Math.max(b.maxX, L.bbox.maxX); b.maxY = Math.max(b.maxY, L.bbox.maxY);
+  }
+  return isFinite(b.minX) ? b : null;
+}
 function fitView() {
   const b = boardBBox();
   const W = stage.clientWidth, H = stage.clientHeight;
@@ -824,154 +935,107 @@ function fitView() {
   const mir = state.mode === "bottom" ? -1 : 1;
   state.view = { scale, ox: W / 2 - mir * cx * scale, oy: H / 2 + cy * scale };
 }
-function setXform(g, dpr) {
-  const v = state.view, mir = state.mode === "bottom" ? -1 : 1;
-  g.setTransform(dpr * v.scale * mir, 0, 0, -dpr * v.scale, dpr * v.ox, dpr * v.oy);
-}
+// Screen x = ox + mir * x * scale, y = oy - y * scale.
 function screenToBoard(sx, sy) {
   const v = state.view, mir = state.mode === "bottom" ? -1 : 1;
   return [(sx - v.ox) / (v.scale * mir), (v.oy - sy) / v.scale];
 }
 
-let offPool = [];
-function offscreen(i, W, H) {
-  let c = offPool[i];
-  if (!c) c = offPool[i] = document.createElement("canvas");
-  if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
-  const g = c.getContext("2d");
-  g.setTransform(1, 0, 0, 1, 0, 0);
-  g.globalCompositeOperation = "source-over";
-  g.clearRect(0, 0, W, H);
-  return c;
-}
-// Rasterize layers into an alpha mask (white where exposed).
-function maskOf(slot, layers, W, H, dpr) {
-  const c = offscreen(slot, W, H), g = c.getContext("2d");
-  setXform(g, dpr);
-  g.fillStyle = "#fff"; g.strokeStyle = "#fff";
-  const minPx = 1 / (state.view.scale * dpr);
-  for (const L of layers) drawRuns(g, L.runs, minPx);
-  return c;
-}
-function tint(slot, mask, color) {
-  const c = offscreen(slot, mask.width, mask.height), g = c.getContext("2d");
-  g.drawImage(mask, 0, 0);
-  g.globalCompositeOperation = "source-in";
-  g.fillStyle = color; g.fillRect(0, 0, c.width, c.height);
-  g.globalCompositeOperation = "source-over";
-  return c;
-}
-// The board is what the outline encloses: flood the outside from the canvas
-// border, and everything the flood did not reach is board.
-function boardMask(slot, outlineLayers, W, H, dpr) {
-  const c = maskOf(slot, outlineLayers, W, H, dpr);
-  const g = c.getContext("2d");
-  const img = g.getImageData(0, 0, W, H), d = img.data;
-  const outside = new Uint8Array(W * H);
-  const q = new Int32Array(W * H);
-  let qh = 0, qt = 0;
-  const push = (i) => { if (!outside[i] && d[i * 4 + 3] < 128) { outside[i] = 1; q[qt++] = i; } };
-  for (let x = 0; x < W; x++) { push(x); push((H - 1) * W + x); }
-  for (let y = 0; y < H; y++) { push(y * W); push(y * W + W - 1); }
-  while (qh < qt) {
-    const i = q[qh++], x = i % W;
-    if (x > 0) push(i - 1); if (x < W - 1) push(i + 1);
-    if (i >= W) push(i - W); if (i < W * (H - 1)) push(i + W);
-  }
-  let any = false;
-  for (let i = 0; i < W * H; i++) {
-    const inside = !outside[i];
-    if (inside && d[i * 4 + 3] < 128) any = true;
-    d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = 255;
-    d[i * 4 + 3] = inside ? 255 : 0;
-  }
-  g.putImageData(img, 0, 0);
-  return any ? c : null;
-}
-
-function render() {
-  const dpr = window.devicePixelRatio || 1;
-  const Wc = stage.clientWidth, Hc = stage.clientHeight;
-  const W = Math.max(1, Math.round(Wc * dpr)), H = Math.max(1, Math.round(Hc * dpr));
-  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; canvas.style.width = Wc + "px"; canvas.style.height = Hc + "px"; }
-  const g = canvas.getContext("2d");
-  g.setTransform(1, 0, 0, 1, 0, 0);
-  g.fillStyle = BOARD.bg; g.fillRect(0, 0, W, H);
+// Rebuild the drawing for the current mode, layers and colors.
+function rebuild() {
+  svg.textContent = "";
   document.getElementById("drop").style.display = state.layers.length ? "none" : "flex";
-  if (!state.layers.length || !state.view) return;
+  if (!state.layers.length) return;
+  const mir = state.mode === "bottom" ? -1 : 1;
+  const defs = el("defs", {}, svg);
+  const root = el("g", { transform: "scale(" + mir + ",-1)" }, svg);
   const vis = state.layers.filter(L => L.visible && L.runs && L.type !== "ignore");
+  const ab = allBBox() || { minX: 0, minY: 0, maxX: 1, maxY: 1 };
+  const m = Math.max(ab.maxX - ab.minX, ab.maxY - ab.minY) * 0.5 + 1;
+  const area = { x: ab.minX - m, y: ab.minY - m, w: ab.maxX - ab.minX + 2 * m, h: ab.maxY - ab.minY + 2 * m };
+  const cover = (color, parent, attrs) => el("rect", Object.assign({ x: area.x, y: area.y, width: area.w, height: area.h, fill: color }, attrs || {}), parent);
+  // A mask from layers: everything they expose is white.
+  function maskOf(layers) {
+    const id = "m" + (++maskSeq);
+    const mk = el("mask", { id, maskUnits: "userSpaceOnUse", x: area.x, y: area.y, width: area.w, height: area.h }, defs);
+    cover("#000", mk);
+    for (const L of layers) appendRuns(el("g", {}, mk), L.runs, "#fff", "#000");
+    return "url(#" + id + ")";
+  }
+  function maskOfPath(d, rule) {
+    const id = "m" + (++maskSeq);
+    const mk = el("mask", { id, maskUnits: "userSpaceOnUse", x: area.x, y: area.y, width: area.w, height: area.h }, defs);
+    cover("#000", mk);
+    el("path", { d, fill: "#fff", "fill-rule": rule }, mk);
+    return "url(#" + id + ")";
+  }
+  const hasClear = L => L.runs.some(r => r.pol === "C");
+  function layerShape(L, color, parent, attrs) {
+    if (hasClear(L)) return cover(color, parent, Object.assign({ mask: maskOf([L]) }, attrs || {}));
+    const g = el("g", attrs || {}, parent);
+    appendRuns(g, L.runs, color, color);
+    return g;
+  }
 
   if (state.mode === "layers") {
     const order = ["outline", "copper", "paste", "mask", "silk", "other", "drill"];
     const sorted = vis.slice().sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
-    for (const L of sorted) {
-      const m = maskOf(0, [L], W, H, dpr);
-      g.globalAlpha = L.type === "drill" ? 1 : 0.75;
-      g.drawImage(tint(1, m, layerColor(L)), 0, 0);
-    }
-    g.globalAlpha = 1;
+    for (const L of sorted) layerShape(L, layerColor(L), root, { opacity: L.type === "drill" ? 1 : 0.75 });
   } else {
     const side = state.mode;
     const of = (type) => vis.filter(L => L.type === type && (L.side === side || L.side === "all"));
     const outlines = of("outline");
-    let board = outlines.length ? boardMask(0, outlines, W, H, dpr) : null;
-    if (!board) {
-      // No closed outline: use the drawing's bounding box.
-      const b = boardBBox();
-      board = offscreen(0, W, H);
-      const bg = board.getContext("2d"); setXform(bg, dpr);
-      bg.fillStyle = "#fff";
-      if (b) bg.fillRect(b.minX, b.minY, b.maxX - b.minX, b.maxY - b.minY);
+    let loops = [];
+    for (const L of outlines) loops = loops.concat(outlineLoops(L.parsed.items));
+    let boardMask;
+    if (loops.length) boardMask = maskOfPath(loops.map(svgPathData).join(""), "evenodd");
+    else {
+      const b = boardBBox() || { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+      boardMask = maskOfPath("M" + b.minX + " " + b.minY + "H" + b.maxX + "V" + b.maxY + "H" + b.minX + "Z", "nonzero");
     }
-    const copper = maskOf(1, of("copper"), W, H, dpr);
-    const masks = of("mask");
-    const opening = maskOf(2, masks, W, H, dpr);
-    // Board in solder-mask color, copper under the mask a lighter shade.
-    g.drawImage(tint(3, board, BOARD.mask), 0, 0);
-    let t = tint(3, copper, BOARD.copperUnder);
-    clipTo(t, board);
-    g.drawImage(t, 0, 0);
+    const copper = of("copper"), masks = of("mask"), silk = of("silk"), drills = of("drill");
+    const copperMask = maskOf(copper);
+    const onBoard = el("g", { mask: boardMask }, root);
+    // Solder mask over the board, copper under it a lighter shade.
+    cover(BOARD.mask, onBoard);
+    cover(BOARD.copperUnder, onBoard, { mask: copperMask });
     // Mask openings show bare substrate and plated copper.
-    const open = tint(3, board, BOARD.substrate);
-    open.getContext("2d").drawImage(tint(4, copper, BOARD.copperOpen), 0, 0);
-    clipTo(open, masks.length ? opening : copper);
-    g.drawImage(open, 0, 0);
-    const silk = of("silk");
-    if (silk.length) {
-      const s = tint(3, maskOf(4, silk, W, H, dpr), BOARD.silk);
-      clipTo(s, board);
-      g.drawImage(s, 0, 0);
-    }
-    const drills = of("drill");
-    if (drills.length) g.drawImage(tint(3, maskOf(4, drills, W, H, dpr), BOARD.hole), 0, 0);
-    const others = of("other");
-    for (const L of others) { g.globalAlpha = 0.6; g.drawImage(tint(3, maskOf(4, [L], W, H, dpr), layerColor(L)), 0, 0); }
-    g.globalAlpha = 1;
+    const open = el("g", { mask: masks.length ? maskOf(masks) : copperMask }, onBoard);
+    cover(BOARD.substrate, open);
+    cover(BOARD.copperOpen, open, { mask: copperMask });
+    if (silk.length) cover(BOARD.silk, onBoard, { mask: maskOf(silk) });
+    if (drills.length) cover(BOARD.hole, root, { mask: maskOf(drills) });
+    for (const L of of("other")) layerShape(L, layerColor(L), root, { opacity: 0.6 });
   }
-  drawMeasure(g, dpr);
+  state.measureEl = el("line", { stroke: "#ff0", "stroke-width": 1.5, "vector-effect": "non-scaling-stroke", "stroke-dasharray": "6 4", visibility: "hidden" }, root);
 }
-function clipTo(c, mask) {
-  const g = c.getContext("2d");
-  g.globalCompositeOperation = "destination-in";
-  g.drawImage(mask, 0, 0);
-  g.globalCompositeOperation = "source-over";
-}
-function drawMeasure(g, dpr) {
-  const m = state.measure;
-  if (!m) return;
-  setXform(g, dpr);
-  g.strokeStyle = "#ff0"; g.lineWidth = 1.5 / state.view.scale;
-  g.setLineDash([6 / state.view.scale, 4 / state.view.scale]);
-  g.beginPath(); g.moveTo(m.a[0], m.a[1]); g.lineTo(m.b[0], m.b[1]); g.stroke();
-  g.setLineDash([]);
-  g.setTransform(1, 0, 0, 1, 0, 0);
+// Move the viewBox to the current pan and zoom.
+function placeView() {
+  const W = stage.clientWidth, H = stage.clientHeight;
+  svg.setAttribute("width", W); svg.setAttribute("height", H);
+  if (!state.view) return;
+  const v = state.view;
+  svg.setAttribute("viewBox", fmtN(-v.ox / v.scale) + " " + fmtN(-v.oy / v.scale) + " " + fmtN(W / v.scale) + " " + fmtN(H / v.scale));
+  const m = state.measure, line = state.measureEl;
+  if (line) {
+    if (m) {
+      line.setAttribute("x1", m.a[0]); line.setAttribute("y1", m.a[1]);
+      line.setAttribute("x2", m.b[0]); line.setAttribute("y2", m.b[1]);
+      line.setAttribute("visibility", "visible");
+    } else line.setAttribute("visibility", "hidden");
+  }
 }
 
-let rafPending = false;
+let rafPending = false, dirty = true;
+function invalidate() { dirty = true; requestRender(); }
 function requestRender() {
   if (rafPending) return;
   rafPending = true;
-  requestAnimationFrame(() => { rafPending = false; render(); });
+  requestAnimationFrame(() => {
+    rafPending = false;
+    if (dirty) { dirty = false; rebuild(); }
+    placeView();
+  });
 }
 
 /* ---------- UI ---------- */
@@ -1007,7 +1071,7 @@ async function loadFiles(fileList) {
   buildLayerList();
   fitView();
   showSize();
-  requestRender();
+  invalidate();
 }
 function showSize() {
   const b = boardBBox();
@@ -1022,10 +1086,10 @@ function buildLayerList() {
     row.className = "row" + (L.error ? " err" : "");
     const cb = document.createElement("input");
     cb.type = "checkbox"; cb.checked = L.visible; cb.disabled = !L.parsed;
-    cb.onchange = () => { L.visible = cb.checked; requestRender(); };
+    cb.onchange = () => { L.visible = cb.checked; invalidate(); };
     const col = document.createElement("input");
     col.type = "color"; col.value = layerColor(L);
-    col.oninput = () => { L.color = col.value; requestRender(); };
+    col.oninput = () => { L.color = col.value; invalidate(); };
     const nm = document.createElement("span");
     nm.className = "name"; nm.textContent = L.name.replace(/^.*\//, "");
     nm.title = L.name + (L.error ? "\n" + L.error : "") + (L.parsed && L.parsed.warnings.length ? "\n" + L.parsed.warnings.join("\n") : "");
@@ -1043,7 +1107,7 @@ function buildLayerList() {
       [L.type, L.side] = sel.value.split("/");
       L.color = null; col.value = layerColor(L);
       L.visible = L.type !== "ignore"; cb.checked = L.visible;
-      showSize(); requestRender();
+      showSize(); invalidate();
     };
     row.append(cb, col, nm, sel);
     box.appendChild(row);
@@ -1064,7 +1128,7 @@ for (const b of document.querySelectorAll("#modes button")) {
     if (state.view && ((prev === "bottom") !== (state.mode === "bottom"))) {
       state.view.ox = stage.clientWidth - state.view.ox;
     }
-    requestRender();
+    invalidate();
   };
 }
 stage.addEventListener("wheel", (e) => {
@@ -1108,7 +1172,7 @@ stage.addEventListener("pointermove", (e) => {
 });
 stage.addEventListener("pointerup", () => { drag = null; });
 window.addEventListener("resize", requestRender);
-render();
+invalidate();
 </script>
 </body>
 </html>
